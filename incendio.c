@@ -1,6 +1,5 @@
-// detec_incendio.c
 // Simulação detector de incêndio com sensores (threads), thread central e bombeiro
-// Compilar: gcc -O2 -pthread -o detec_incendio detec_incendio.c
+// Compilar: gcc -O2 -pthread -o incendio incendio.c
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,7 +37,7 @@ typedef struct sensor_s {
     int id;
     int r, c;
     pthread_t tid;
-    int alive; 
+    int alive;
     message_t *queue_head;
     message_t *queue_tail;
     pthread_mutex_t qmutex;
@@ -299,29 +298,36 @@ void *sensor_thread_func(void *arg) {
 // central thread
 void *central_thread_func(void *arg) {
     (void)arg;
-    // central keeps set of processed msg ids to avoid duplicate logging
     #define CENTRAL_HISTORY 2048
     long processed[CENTRAL_HISTORY];
     int pidx = 0;
     memset(processed, 0, sizeof(processed));
 
-    while (running) {
+    for (;;) {
         pthread_mutex_lock(&central_q_mutex);
+        /* aguarda enquanto estiver rodando e fila vazia */
         while (running && central_q_head == NULL) {
             pthread_cond_wait(&central_q_cond, &central_q_mutex);
         }
-        if (!running) { pthread_mutex_unlock(&central_q_mutex); break; }
+        /* se não há mensagens e running==0, sair (fila já vazia) */
+        if (central_q_head == NULL && !running) {
+            pthread_mutex_unlock(&central_q_mutex);
+            break;
+        }
+        /* retira uma mensagem (pode ser NULL se race, verificar) */
         message_t *m = central_q_head;
-        central_q_head = m->next;
-        if (central_q_head == NULL) central_q_tail = NULL;
+        if (m) {
+            central_q_head = m->next;
+            if (central_q_head == NULL) central_q_tail = NULL;
+        }
         pthread_mutex_unlock(&central_q_mutex);
 
-        // check if already processed
+        if (!m) continue;
+
         int seen = 0;
         for (int i = 0; i < CENTRAL_HISTORY; ++i) if (processed[i] == m->msg_id) { seen = 1; break; }
         if (!seen) {
             processed[pidx] = m->msg_id; pidx = (pidx+1)%CENTRAL_HISTORY;
-            // log to file
             FILE *f = fopen("incendios.log", "a");
             if (f) {
                 fprintf(f, "MSG %ld | sensor %d | fire (%d,%d) | %s\n",
@@ -330,7 +336,6 @@ void *central_thread_func(void *arg) {
             } else {
                 perror("fopen incendios.log");
             }
-            // enqueue firefighter with coords
             enqueue_firefighter(m->fire_r, m->fire_c);
         }
         free(m);
@@ -341,18 +346,22 @@ void *central_thread_func(void *arg) {
 // firefighter thread: takes coords, waits 2s, then extinguishes
 void *firefighter_thread_func(void *arg) {
     (void)arg;
-    while (running) {
+    for (;;) {
         pthread_mutex_lock(&ff_mutex);
         while (running && ff_head == NULL) pthread_cond_wait(&ff_cond, &ff_mutex);
-        if (!running) { pthread_mutex_unlock(&ff_mutex); break; }
+        /* se fila vazia e running==0, sair */
+        if (ff_head == NULL && !running) { pthread_mutex_unlock(&ff_mutex); break; }
         ff_node_t *n = ff_head;
-        ff_head = n->next;
-        if (ff_head == NULL) ff_tail = NULL;
+        if (n) {
+            ff_head = n->next;
+            if (ff_head == NULL) ff_tail = NULL;
+        }
         pthread_mutex_unlock(&ff_mutex);
+
+        if (!n) continue;
 
         int r = n->r, c = n->c;
         free(n);
-        // simulate travel/time to put off fire
         sleep(FIREFIGHTER_TIME_SEC);
         pthread_mutex_lock(&grid_mutex);
         int was_fire = 0;
@@ -379,7 +388,10 @@ void *firefighter_thread_func(void *arg) {
 
 // display function
 void print_grid() {
+    // lock sensors first, then grid (same order used elsewhere) to avoid deadlock
+    pthread_mutex_lock(&sensors_mutex);
     pthread_mutex_lock(&grid_mutex);
+
     // clear terminal
     printf("\033[H\033[J");
     printf("Mapa 30x30 - '.' árvore, '@' fogo, 'T' sensor, 'x' sensor destruído\n");
@@ -398,7 +410,9 @@ void print_grid() {
         }
         putchar('\n');
     }
+
     pthread_mutex_unlock(&grid_mutex);
+    pthread_mutex_unlock(&sensors_mutex);
     fflush(stdout);
 }
 
@@ -430,13 +444,15 @@ void setup_sensors() {
 void generate_random_fire() {
     int r = rand() % N;
     int c = rand() % N;
+
+    // lock sensors first, then grid to maintain a consistent lock order and avoid deadlock
+    pthread_mutex_lock(&sensors_mutex);
     pthread_mutex_lock(&grid_mutex);
+
     // place fire regardless of what's there
     grid[r][c] = '@';
-    pthread_mutex_unlock(&grid_mutex);
 
     // if there's a sensor at (r,c), destroy it
-    pthread_mutex_lock(&sensors_mutex);
     int sid = sensor_id_map[r][c];
     if (sid != -1) {
         sensor_t *s = sensors[sid];
@@ -449,28 +465,60 @@ void generate_random_fire() {
         pthread_cond_signal(&s->qcond);
         pthread_mutex_unlock(&s->qmutex);
     }
+
+    pthread_mutex_unlock(&grid_mutex);
     pthread_mutex_unlock(&sensors_mutex);
 }
 
-void sigint_handler(int sig) {
-    (void)sig;
-    running = 0;
-    // wake central and ff and sensors
-    pthread_cond_signal(&central_q_cond);
-    pthread_cond_signal(&ff_cond);
-    // wake all sensors conds
-    pthread_mutex_lock(&sensors_mutex);
-    for (int i = 0; i < sensor_count; ++i) {
-        pthread_mutex_lock(&sensors[i]->qmutex);
-        pthread_cond_signal(&sensors[i]->qcond);
-        pthread_mutex_unlock(&sensors[i]->qmutex);
+// signal-waiting thread: aguarda SIGINT com sigwait e acorda as threads com segurança
+void *signal_thread_func(void *arg) {
+    (void)arg;
+    sigset_t set;
+    int sig;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+
+    if (sigwait(&set, &sig) == 0) {
+        if (sig == SIGINT) {
+            running = 0;
+
+            // acordar central e bombeiro
+            pthread_mutex_lock(&central_q_mutex);
+            pthread_cond_broadcast(&central_q_cond);
+            pthread_mutex_unlock(&central_q_mutex);
+
+            pthread_mutex_lock(&ff_mutex);
+            pthread_cond_broadcast(&ff_cond);
+            pthread_mutex_unlock(&ff_mutex);
+
+            // avisar sensores (marca alive=0 e acorda filas)
+            pthread_mutex_lock(&sensors_mutex);
+            for (int i = 0; i < sensor_count; ++i) {
+                sensor_t *s = sensors[i];
+                if (!s) continue;
+                pthread_mutex_lock(&s->qmutex);
+                s->alive = 0;
+                pthread_cond_broadcast(&s->qcond);
+                pthread_mutex_unlock(&s->qmutex);
+            }
+            pthread_mutex_unlock(&sensors_mutex);
+        }
     }
-    pthread_mutex_unlock(&sensors_mutex);
+    return NULL;
 }
 
 int main() {
     srand(time(NULL));
-    signal(SIGINT, sigint_handler);
+
+    // bloquear SIGINT em todas as threads criadas a seguir e tratar via sigwait em thread dedicada
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    // criar thread que fará sigwait(SIGINT)
+    pthread_t sig_tid;
+    pthread_create(&sig_tid, NULL, signal_thread_func, NULL);
 
     // init grid
     pthread_mutex_lock(&grid_mutex);
@@ -521,6 +569,7 @@ int main() {
     pthread_mutex_destroy(&ff_mutex);
     pthread_cond_destroy(&central_q_cond);
     pthread_cond_destroy(&ff_cond);
+    pthread_mutex_destroy(&global_msg_mutex); // destroy the msg id mutex
 
     printf("\nSimulação terminada.\n");
     return 0;
